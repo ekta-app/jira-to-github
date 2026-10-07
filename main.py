@@ -154,7 +154,7 @@ def process_migration(csv_file_path: pathlib.Path):
                 continue
 
             # is it actually fixed?
-            res = subprocess.run(["git", "log", f"--grep={matching_gh_issue["number"]}", f"--grep='{jira_issue.key}'", "-1", "--format=%H"], cwd=pathlib.Path.home()/"source"/"ekta", capture_output=True)
+            res = subprocess.run(["git", "log", f"--grep='^#{matching_gh_issue["number"]}[: ]'", f"--grep='^EKTA-{jira_issue.key}[: ]'", "-1", "--format=%H"], cwd=pathlib.Path.home()/"source"/"ekta", capture_output=True)
             if res.stdout.strip():
                 print(f"...but issue is fixed in commit {res.stdout.decode().strip()}. Moving on")
                 j2g_mapping.set_gh_issue_number(jira_issue.key, matching_gh_issue["number"])
@@ -232,52 +232,105 @@ def process_migration(csv_file_path: pathlib.Path):
             print(f"{jira_issue.key}: new issue created {created_issue["number"]}")
             j2g_mapping.set_gh_issue_number(jira_issue.key, created_issue["number"])
 
-    return
-
     # Pass 2: related to, blocked by, parent link
 
     for jira_issue in jira_issues:
-        gh_issue_id = j2g_mapping[jira_issue.key]
+        if jira_issue.is_resolved:
+            print(f"{jira_issue.key}: already resolved.")
+            continue
+
+        with open("relationships_processed.json") as f:
+            processed = json.load(f)
+
+        gh_issue_num = j2g_mapping.get_gh_issue_number(jira_issue.key)
+        if gh_issue_num is None:
+            print(f"{jira_issue.key}: No GitHub issue found in mapping.")
+            sys.exit(69)
         gh_issue = None
 
+        processed_stuff = []
+
         if len(jira_issue.related_to) > 0:
-            # curl -L \
-            #   -X POST \
-            #   -H "Accept: application/vnd.github+json" \
-            #   -H "Authorization: Bearer <YOUR-TOKEN>" \
-            #   -H "X-GitHub-Api-Version: 2026-03-10" \
-            #   https://api.github.com/repos/OWNER/REPO/issues/ISSUE_NUMBER/relates_to \
-            #   -d '{"issue_id":1}'
-            for jira_related_to in jira_issue.related_to:
-                gh_related_to = j2g_mapping[jira_related_to]
-                r = requests.post(f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues/{gh_issue_id}/relates_to",
-                                  json={"issue_id": gh_related_to},
-                                  headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {GITHUB_TOKEN}", "X-GitHub-Api-Version": "2026-03-10"})
-                time.sleep(1)
-                if r.status_code != 201:
-                    print(f"Failed to set {gh_related_to} as related to {gh_issue_id}")
+            if "related" in processed.get(jira_issue.key, []):
+                print(f"{jira_issue.key}: done with related.")
+            else:
+                # curl -L \
+                #   -X POST \
+                #   -H "Accept: application/vnd.github+json" \
+                #   -H "Authorization: Bearer <YOUR-TOKEN>" \
+                #   -H "X-GitHub-Api-Version: 2026-03-10" \
+                #   https://api.github.com/repos/OWNER/REPO/issues/ISSUE_NUMBER/relates_to \
+                #   -d '{"issue_id":1}'
+                for jira_related_to in jira_issue.related_to:
+                    gh_related_to_num = j2g_mapping.get_gh_issue_number(jira_related_to)
+                    if gh_related_to_num is None:
+                        print(f"{jira_issue.key}/#{gh_issue_num}: Could not find related to issue {jira_related_to}")
+                    else:
+                        gh_related_to = repo.get_issue(gh_related_to_num)
+                        time.sleep(1)
+                        r = requests.post(f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues/{gh_issue_num}/relates_to",
+                                        json={"issue_id": gh_related_to.id},
+                                        headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {GITHUB_TOKEN}", "X-GitHub-Api-Version": "2026-03-10"})
+                        time.sleep(1)
+                        if r.status_code != 201:
+                            print(f"Failed to set {gh_related_to_num} as related to {gh_issue_num}")
+
+                processed_stuff.append("related")
 
         if len(jira_issue.blocked_by) > 0:
-            # curl -L \
-            #   -X POST \
-            #   -H "Accept: application/vnd.github+json" \
-            #   -H "Authorization: Bearer <YOUR-TOKEN>" \
-            #   -H "X-GitHub-Api-Version: 2026-03-10" \
-            #   https://api.github.com/repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocked_by \
-            #   -d '{"issue_id":1}'
-            for jira_blocked_by in jira_issue.blocked_by:
-                gh_blocked_by = j2g_mapping[jira_blocked_by]
-                r = requests.post(f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues/{gh_issue_id}/dependencies/blocked_by",
-                                  json={"issue_id": gh_blocked_by},
-                                  headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {GITHUB_TOKEN}", "X-GitHub-Api-Version": "2026-03-10"})
-                time.sleep(1)
-                if r.status_code != 201:
-                    print(f"Failed to set {gh_blocked_by} as blocking {gh_issue_id}")
+            if "blocked" in processed.get(jira_issue.key, []):
+                print(f"{jira_issue.key}: done with blocked.")
+            else:
+                # curl -L \
+                #   -X POST \
+                #   -H "Accept: application/vnd.github+json" \
+                #   -H "Authorization: Bearer <YOUR-TOKEN>" \
+                #   -H "X-GitHub-Api-Version: 2026-03-10" \
+                #   https://api.github.com/repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocked_by \
+                #   -d '{"issue_id":1}'
+                for jira_blocked_by in jira_issue.blocked_by:
+                    gh_blocked_by_num = j2g_mapping.get_gh_issue_number(jira_blocked_by)
+                    if gh_blocked_by_num is None:
+                        print(f"{jira_issue.key}/#{gh_issue_num}: Could not find related to issue {jira_blocked_by}")
+                    else:
+                        gh_blocked_by = repo.get_issue(gh_blocked_by_num)
+                        r = requests.post(f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues/{gh_issue_num}/dependencies/blocked_by",
+                                        json={"issue_id": gh_blocked_by.id},
+                                        headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {GITHUB_TOKEN}", "X-GitHub-Api-Version": "2026-03-10"})
+                        time.sleep(1)
+                        if r.status_code != 201:
+                            print(f"Failed to set {gh_blocked_by} as blocking {gh_issue_num}")
+
+                processed_stuff.append("blocked")
 
         if jira_issue.parent:
-            gh_parent_issue = repo.get_issue(j2g_mapping[jira_issue.parent])
-            gh_parent_issue.add_sub_issue(gh_issue_id)
-            time.sleep(1)
+            if "parent" in processed.get(jira_issue.key, []):
+                print(f"{jira_issue.key}: done with parent.")
+            else:
+                gh_parent_issue_num = j2g_mapping.get_gh_issue_number(jira_issue.parent)
+                if gh_parent_issue_num is None:
+                    print(f"{jira_issue.key}: No GitHub issue found in mapping.")
+                else:
+                    gh_issue = repo.get_issue(gh_issue_num)
+                    if gh_issue.parent_issue_url:
+                        print(f"{gh_issue_num} already has a parent. Moving on")
+                    else:
+                        gh_parent_issue = repo.get_issue(gh_parent_issue_num)
+                        time.sleep(1)
+
+                        # need issue ID
+                        time.sleep(1)
+
+                        gh_parent_issue.add_sub_issue(gh_issue.id)
+                        time.sleep(1)
+
+                processed_stuff.append("parent")
+
+        if len(processed_stuff) > 0:
+            processed[jira_issue.key] = processed_stuff
+
+        with open("relationships_processed.json", "w") as f:
+            json.dump(processed, f)
 
     print("\n--- Migration Complete ---")
 

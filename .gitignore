@@ -6,5 +6,6 @@ users.json
 Jira.csv
 gh_issues.json
 jira_to_gh_issue_map.json
+relationships_processed.json
 
 TOKEN
