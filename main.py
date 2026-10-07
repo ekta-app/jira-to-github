@@ -1,235 +1,297 @@
 import json
 import os
 import csv
-from typing import Any
-from github import Github, Auth, IssueType
+import pathlib
+import subprocess
+import sys
+import time
+from github import Github, Auth, Issue
+import requests
 
 # --- Configuration ---
 GITHUB_TOKEN = os.getenv("GITHUB_PAT")
-
-g = Github(GITHUB_TOKEN, per_page=100)
+if not GITHUB_TOKEN:
+    sys.exit(69)
 
 REPO_OWNER = "ekta-app"
 REPO_NAME = "ekta"
+
+g = Github(auth=Auth.Token(GITHUB_TOKEN), per_page=100)
+repo = g.get_repo(f"{REPO_OWNER}/{REPO_NAME}")
+
 JIRA_WORKSPACE = "https://ekta-app.atlassian.net"
 PROJECT_KEY = "EKTA"
 
-# --- CSV Column Mapping ---
-# Verify these match the exact headers in row 1 of your Jira CSV export
-# COL_SUMMARY = "Summary"
-# COL_KEY = "Issue key"
-# COL_TYPE = "Issue Type"
-# COL_STATUS = "Status"
-# COL_ASSIGNEE = "Assignee"  # Some exports use "Assignee Id" or "Assignee Email"
-# COL_DESCRIPTION = "Description"
-# COL_BLOCKED_BY = "Inward issue link (Blocks)"  # can have multiple
-# COL_DUPLICATED_BY = "Inward issue link (Duplicate)"  # can have multiple
-# COL_CAUSED_BY = "Inward issue link (Problem/Incident)"
-# COL_RELATED_TO = "Inward issue link (Relates)"
-# COL_ATTACHMENT = "Attachment"  # can have multiple; fetch the URL and upload with GitHub issue
-# COL_CIRCUIT = "Custom field (Circuit)"  # can have multiple
-# COL_REQUESTER = "Custom field (Request Group)"
-# COL_PARENT_KEY = "Parent key"  # Or "Epic Link" depending on your hierarchy setup
+BASE_COL = ord('A')-1
 
 
-COL_SUMMARY = 0
-COL_KEY = 1
-COL_TYPE = 3
-COL_STATUS = 4
-COL_ASSIGNEE = 13
-COL_DESCRIPTION = 27
-COL_BLOCKED_BY = [43, 44]
-COL_DUPLICATED_BY = [48, 49, 50]
-COL_CAUSED_BY = [52]
-COL_RELATED_TO = [57]
-COL_ATTACHMENT = [60, 61]
-COL_CIRCUIT = [72, 73, 74, 75, 76]
-COL_REQUESTER = [96]
-COL_PARENT_KEY = 128
+def col(_col: str):
+    idx = 0
+    for i, c in enumerate(_col):
+        idx += (ord(c) - BASE_COL) * (26 ** (len(_col) - i - 1))
+    return idx-1
+
+
+COL_SUMMARY = col("A")
+COL_KEY = col("B")
+COL_TYPE = col("D")
+COL_STATUS = col("E")
+COL_PRIORITY = col("L")
+COL_IS_RESOLVED = col("M")
+COL_ASSIGNEE = col("N")
+COL_DESCRIPTION = col("AB")
+COL_BLOCKED_BY = [col("AR"), col("AS")]
+COL_DUPLICATED_BY = [col("AW"), col("AX"), col("AY")]
+COL_CAUSED_BY = [col("BA")]
+COL_RELATED_TO = [col("BF")]
+COL_ATTACHMENT = [col("BI"), col("BJ")]
+COL_CIRCUIT = [col("BT"), col("BU"), col("BV"), col("BW"), col("BX")]
+COL_REQUESTER = col("CR")
+COL_PARENT_KEY = col("EC")
 
 # --- User Mapping ---
 with open("users.json") as f:
     USER_MAP = json.load(f)
 
 unmapped_users = set()
-jira_to_gh_issue_map = {}  # Maps Jira Key (e.g. EKTA-12) to new GitHub Issue Number
 
-# --- API Helpers ---
-
-
-# def reopen_github_issue(issue_number, jira_key):
-#    """Reopens an existing GitHub issue and links it to Jira."""
-#    url = f"{BASE_URL}/issues/{issue_number}"
-#    payload = {"state": "open"}
-#    res = requests.patch(url, json=payload, headers=HEADERS)
-#
-#    if res.status_code == 200:
-#        comment_url = f"{url}/comments"
-#        requests.post(comment_url, json={
-#                      "body": f"Reopened from Jira migration. Original Jira ticket: {JIRA_WORKSPACE}/browse/{jira_key}"}, headers=HEADERS)
-#        print(f"Reopened GitHub Issue #{issue_number} for {jira_key}")
-#    else:
-#        print(f"Failed to reopen #{issue_number}: {res.text}")
-#
-#
-# def create_github_issue(row):
-#    """Creates a new GitHub issue mapping all specified CSV fields."""
-#    jira_key = row.get(COL_KEY)
-#
-#    # 1. Map Labels
-#    labels = []
-#    if row.get(COL_TYPE):
-#        labels.append(f"type: {row[COL_TYPE].lower()}")
-#    if row.get(COL_STATUS):
-#        labels.append(f"status: {row[COL_STATUS].lower()}")
-#    if row.get(COL_REQUESTER):
-#        labels.append(f"requester: {row[COL_REQUESTER].lower()}")
-#    if row.get(COL_CIRCUIT):
-#        labels.append(f"circuit: {row[COL_CIRCUIT].lower()}")
-#
-#    # 2. Map Assignee
-#    gh_assignee = None
-#    jira_assignee = row.get(COL_ASSIGNEE)
-#    if jira_assignee:
-#        if jira_assignee in USER_MAP:
-#            gh_assignee = USER_MAP[jira_assignee]
-#        else:
-#            unmapped_users.add(jira_assignee)
-#
-#    # 3. Construct Body (Maintaining external links)
-#    description = row.get(COL_DESCRIPTION, "No description provided.")
-#    body = f"{description}\n\n---\n*Migrated from Jira: [{jira_key}]({JIRA_WORKSPACE}/browse/{jira_key})*"
-#
-#    payload = {
-#        "title": f"[{jira_key}] {row.get(COL_SUMMARY, 'Untitled')}",
-#        "body": body,
-#        "labels": labels,
-#    }
-#
-#    if gh_assignee:
-#        payload["assignees"] = [gh_assignee]
-#
-#    res = requests.post(f"{BASE_URL}/issues", json=payload, headers=HEADERS)
-#
-#    if res.status_code == 201:
-#        new_issue_num = res.json().get("number")
-#        jira_to_gh_issue_map[jira_key] = new_issue_num
-#        print(f"Created GitHub Issue #{new_issue_num} for {jira_key}")
-#        return new_issue_num
-#    else:
-#        print(f"Failed to create issue for {jira_key}: {res.text}")
-#        return None
-#
-# --- Beta API Helpers for Relationships ---
-#
-#
-# def link_sub_issue(parent_gh_id, child_gh_id):
-#    """Uses GitHub's Beta Sub-issues API/GraphQL to establish hierarchy."""
-#    # Fallback: Add a comment on the parent referencing the child.
-#    url = f"{BASE_URL}/issues/{parent_gh_id}/comments"
-#    requests.post(url, json={"body": f"Tracking sub-task: #{child_gh_id}"}, headers=HEADERS)
-#
-#
-# def link_blocked_by(blocked_gh_id, blocker_gh_id):
-#    """Establishes a blocked-by relationship."""
-#    # Fallback: Add a comment.
-#    url = f"{BASE_URL}/issues/{blocked_gh_id}/comments"
-#    requests.post(url, json={"body": f"Blocked by: #{blocker_gh_id}"}, headers=HEADERS)
-#
 
 class JiraIssue:
-    summary: str
-    key: str
-    type: str
-    status: str
-    assignee: str
-    description: str
-    blocked_by: list[str]
-    duplicated_by: list[str]
-    caused_by: list[str]
-    related_to: list[str]
-    attachment: list[str]
-    circuit: list[str]
-    requester: list[str]
-    parent: str
-
     def __init__(self, row: list[str]) -> None:
-        self.summary = row[COL_SUMMARY]
+        self.title = row[COL_SUMMARY]
         self.key = row[COL_KEY]
         self.type = row[COL_TYPE]
-        self.status = row[COL_STATUS]
+        self.priority = row[COL_PRIORITY]
+        self.is_resolved = row[COL_IS_RESOLVED] == "Done"
         self.assignee = row[COL_ASSIGNEE]
         self.description = row[COL_DESCRIPTION]
         self.blocked_by = [row[x] for x in COL_BLOCKED_BY if row[x] != ""]
-        self.duplicated_by = [row[x] for x in COL_DUPLICATED_BY if row[x] != ""]
-        self.caused_by = [row[x] for x in COL_CAUSED_BY if row[x] != ""]
         self.related_to = [row[x] for x in COL_RELATED_TO if row[x] != ""]
-        self.attachment = [row[x] for x in COL_ATTACHMENT if row[x] != ""]
-        self.circuit = [row[x] for x in COL_CIRCUIT if row[x] != ""]
-        self.requester = [row[x] for x in COL_REQUESTER if row[x] != ""]
+        self.circuit = [row[x] for x in COL_CIRCUIT if row[x] != "" and row[x] != "EKTA"]
+        self.requester = row[COL_REQUESTER]
         self.parent = row[COL_PARENT_KEY]
+
+
+# JIRA - GitHub translation
+PRIORITY_MAP = {
+    "Critical": "Urgent",
+    "High": "High",
+    "Medium": "Medium",
+    "Low": "Low",
+}
+REQUESTER_MAP = {
+    "Team": "Team",
+    "Championship": "Circuit manager",
+    "EKTA": "Ekta",
+    "Competition": "Competition",
+}
+
+GH_PRIORITY_FIELD_ID = 14550550
+GH_CIRCUIT_FIELD_ID = 45110981
+GH_REQUESTER_FIELD_ID = 44279774
+
+# Jira to GitHub issue mgmt
+class JiraToGithubMapping:
+    j2g_map: dict[str, int] = {}
+
+    def get_gh_issue_number(self, jira_key: str):
+        with open("jira_to_gh_issue_map.json") as f:
+            self.j2g_map = json.load(f)
+            try:
+                return self.j2g_map[jira_key]
+            except:
+                return None
+
+    def set_gh_issue_number(self, jira_key: str, gh_number: int):
+        with open("jira_to_gh_issue_map.json") as f:
+            self.j2g_map = json.load(f)
+        self.j2g_map[jira_key] = gh_number
+        with open("jira_to_gh_issue_map.json", "w") as f:
+            json.dump(self.j2g_map, f)
+
+j2g_mapping = JiraToGithubMapping()
+
 
 # --- Main Orchestration ---
 
 
-def process_migration(csv_file_path):
-    issues: list[JiraIssue] = []
+def process_migration(csv_file_path: pathlib.Path):
+    jira_issues: list[JiraIssue] = []
 
-    # Read the CSV file into memory
+    # Read the JIRA CSV file
     with open(csv_file_path, mode='r', encoding='utf-8-sig') as f:
         raw_reader = csv.reader(f)
-        raw_headers = next(raw_reader)
+        next(raw_reader)
 
         for row in raw_reader:
-            issues.append(JiraIssue(row))
+            jira_issues.append(JiraIssue(row))
+
+    # Read the GitHub JSON file
+    with open("gh_issues.json") as f:
+        gh_issues_local = json.load(f)
 
     # Pass 1: Create or Reopen Issues
-    for issue in issues:
-        jira_key = issue.key
+    for jira_issue in jira_issues:
+        if jira_issue.is_resolved:
+            print(f"{jira_issue.key}: already resolved.")
+            continue
+        if j2g_mapping.get_gh_issue_number(jira_issue.key):
+            print(f"{jira_issue.key}: already processed.")
+            continue
 
-        # if github_link:
-        #    # Note: You will need to extract the raw issue number from the link format here
-        #    # e.g., if the link is "https://github.com/ekta-app/ekta/issues/123", extract "123"
-        #    gh_issue_num = 123  # Replace with parsed number
-        #    reopen_github_issue(gh_issue_num, jira_key)
-        #    jira_to_gh_issue_map[jira_key] = gh_issue_num
-        # else:
-        #    create_github_issue(issue)
+        matching_gh_issue = None
+        # gh_issues = g.search_issues(f"is:issue repo:{REPO_OWNER}/{REPO_NAME} {jira_issue.title}")
+        potential_gh_issues_local = [i for i in gh_issues_local if i["title"].strip() == jira_issue.title]
+        if len(potential_gh_issues_local) > 0:
+            matching_gh_issue = potential_gh_issues_local[0]
 
-    # Pass 2: Map Hierarchy and Relationships
-    # for issue in issues:
-    #    current_jira_key = issue.get(COL_KEY)
-    #    current_gh_id = jira_to_gh_issue_map.get(current_jira_key)
+            print(f"{jira_issue.key}: found matching issue number {matching_gh_issue["number"]}", end="")
 
-    #    if not current_gh_id:
-    #        continue
+            # is it already reopened?
+            if matching_gh_issue["state"] == "open":
+                print(f"...but issue has already been reopened. Moving on")
+                j2g_mapping.set_gh_issue_number(jira_issue.key, matching_gh_issue["number"])
+                continue
 
-    #    # Handle Epic/Parent Links
-    #    parent_key = issue.get(COL_PARENT_KEY)
-    #    if parent_key and parent_key in jira_to_gh_issue_map:
-    #        parent_gh_id = jira_to_gh_issue_map[parent_key]
-    #        link_sub_issue(parent_gh_id, current_gh_id)
+            # is it actually fixed?
+            res = subprocess.run(["git", "log", f"--grep={matching_gh_issue["number"]}", f"--grep='{jira_issue.key}'", "-1", "--format=%H"], cwd=pathlib.Path.home()/"source"/"ekta", capture_output=True)
+            if res.stdout.strip():
+                print(f"...but issue is fixed in commit {res.stdout.decode().strip()}. Moving on")
+                j2g_mapping.set_gh_issue_number(jira_issue.key, matching_gh_issue["number"])
+                continue
 
-    #    # Handle Issue Links (Blocked By)
-    #    blocker_key = issue.get(COL_BLOCKED_BY)
-    #    if blocker_key and blocker_key in jira_to_gh_issue_map:
-    #        blocker_gh_id = jira_to_gh_issue_map[blocker_key]
-    #        link_blocked_by(current_gh_id, blocker_gh_id)
+        # Issue fields
+        issue_opts = {}
+        # custom fields
+        issue_field_values = []
+        if jira_issue.type != "Sub-task":
+            issue_opts["type"] = jira_issue.type
+        if jira_issue.priority:
+            issue_field_values.append({
+                "field_id": GH_PRIORITY_FIELD_ID,
+                "value": PRIORITY_MAP[jira_issue.priority]
+            })
+        if jira_issue.assignee:
+            issue_opts["assignees"] = [USER_MAP[jira_issue.assignee]]
+        if len(jira_issue.circuit) > 0:
+            issue_field_values.append({
+                "field_id": GH_CIRCUIT_FIELD_ID,
+                "value": jira_issue.circuit,
+            })
+        if jira_issue.requester:
+            issue_field_values.append({
+                "field_id": GH_REQUESTER_FIELD_ID,
+                "value": REQUESTER_MAP[jira_issue.requester]
+            })
 
-    # print("\n--- Migration Complete ---")
-    # if unmapped_users:
-    #    print("NOTE: The following Jira users were not in your mapping and were left unassigned:")
-    #    for u in unmapped_users:
-    #        if u.strip():  # Ignore empty strings
-    #            print(f"- {u}")
+        if len(issue_field_values) > 0:
+            issue_opts["issue_field_values"] = issue_field_values
+
+        if matching_gh_issue:
+            # curl -L \
+            #   -X PATCH \
+            #   -H "Accept: application/vnd.github+json" \
+            #   -H "Authorization: Bearer <YOUR-TOKEN>" \
+            #   -H "X-GitHub-Api-Version: 2026-03-10" \
+            #   https://api.github.com/repos/OWNER/REPO/issues/ISSUE_NUMBER \
+            #   -d '{"title":"Found a bug","body":"I'\''m having a problem with this.","assignees":["octocat"],"milestone":1,"state":"open","labels":["bug"]}'
+            r = requests.patch(f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues/{matching_gh_issue["number"]}",
+                               json={"state": "open", **issue_opts},
+                               headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {GITHUB_TOKEN}", "X-GitHub-Api-Version": "2026-03-10"})
+            if r.status_code != 200:
+                print(f"Failed to update issue {matching_gh_issue["number"]}")
+                sys.exit(69)
+
+            time.sleep(1)
+            gh_issue = repo.get_issue(matching_gh_issue["number"])
+            gh_issue.create_comment(f"Reopened from Jira migration. Original Jira ticket: {JIRA_WORKSPACE}/browse/{jira_issue.key}")
+            time.sleep(1)
+            print("...migrated.")
+            j2g_mapping.set_gh_issue_number(jira_issue.key, gh_issue.number)
+        else:
+            body = f"*Migrated from Jira: {JIRA_WORKSPACE}/browse/{jira_issue.key}*"
+            if jira_issue.description:
+                body = f"{jira_issue.description}\n\n---\n{body}"
+
+            # curl -L \
+            #   -X POST \
+            #   -H "Accept: application/vnd.github+json" \
+            #   -H "Authorization: Bearer <YOUR-TOKEN>" \
+            #   -H "X-GitHub-Api-Version: 2026-03-10" \
+            #   https://api.github.com/repos/OWNER/REPO/issues \
+            #   -d '{"title":"Found a bug","body":"I'\''m having a problem with this.","assignees":["octocat"],"milestone":1,"labels":["bug"]}'
+            r = requests.post(f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues",
+                              json={ "title": jira_issue.title, "body": body, **issue_opts },
+                              headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {GITHUB_TOKEN}", "X-GitHub-Api-Version": "2026-03-10"})
+            if r.status_code != 201:
+                print(f"Failed to create issue for {jira_issue.key}")
+                sys.exit(69)
+            created_issue = r.json()
+
+            time.sleep(1)
+            print(f"{jira_issue.key}: new issue created {created_issue["number"]}")
+            j2g_mapping.set_gh_issue_number(jira_issue.key, created_issue["number"])
+
+    return
+
+    # Pass 2: related to, blocked by, parent link
+
+    for jira_issue in jira_issues:
+        gh_issue_id = j2g_mapping[jira_issue.key]
+        gh_issue = None
+
+        if len(jira_issue.related_to) > 0:
+            # curl -L \
+            #   -X POST \
+            #   -H "Accept: application/vnd.github+json" \
+            #   -H "Authorization: Bearer <YOUR-TOKEN>" \
+            #   -H "X-GitHub-Api-Version: 2026-03-10" \
+            #   https://api.github.com/repos/OWNER/REPO/issues/ISSUE_NUMBER/relates_to \
+            #   -d '{"issue_id":1}'
+            for jira_related_to in jira_issue.related_to:
+                gh_related_to = j2g_mapping[jira_related_to]
+                r = requests.post(f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues/{gh_issue_id}/relates_to",
+                                  json={"issue_id": gh_related_to},
+                                  headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {GITHUB_TOKEN}", "X-GitHub-Api-Version": "2026-03-10"})
+                time.sleep(1)
+                if r.status_code != 201:
+                    print(f"Failed to set {gh_related_to} as related to {gh_issue_id}")
+
+        if len(jira_issue.blocked_by) > 0:
+            # curl -L \
+            #   -X POST \
+            #   -H "Accept: application/vnd.github+json" \
+            #   -H "Authorization: Bearer <YOUR-TOKEN>" \
+            #   -H "X-GitHub-Api-Version: 2026-03-10" \
+            #   https://api.github.com/repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocked_by \
+            #   -d '{"issue_id":1}'
+            for jira_blocked_by in jira_issue.blocked_by:
+                gh_blocked_by = j2g_mapping[jira_blocked_by]
+                r = requests.post(f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues/{gh_issue_id}/dependencies/blocked_by",
+                                  json={"issue_id": gh_blocked_by},
+                                  headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {GITHUB_TOKEN}", "X-GitHub-Api-Version": "2026-03-10"})
+                time.sleep(1)
+                if r.status_code != 201:
+                    print(f"Failed to set {gh_blocked_by} as blocking {gh_issue_id}")
+
+        if jira_issue.parent:
+            gh_parent_issue = repo.get_issue(j2g_mapping[jira_issue.parent])
+            gh_parent_issue.add_sub_issue(gh_issue_id)
+            time.sleep(1)
+
+    print("\n--- Migration Complete ---")
 
 
-def get_all_gh_issues():
+def fetch_all_github_issues():
+    issue_data = []
     for gh_issue in g.get_repo("ekta-app/ekta").get_issues(state="all"):
         if gh_issue.pull_request is None:
-            print(gh_issue.raw_data)
+            issue_data.append(gh_issue.raw_data)
+
+    with open("gh_issues.json", "w") as f:
+        json.dump(issue_data, f, indent=4)
 
 
 if __name__ == "__main__":
-    # Step 1: establish associations of existing GitHub issues
-    get_all_gh_issues()
+    process_migration(pathlib.Path.home() / "Documents" / "Ekta" / "Jira" / "Jira 2026-08-22.csv")
+
